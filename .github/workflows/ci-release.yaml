@@ -100,3 +100,32 @@ jobs:
             gh release create "${{ needs.set-params.outputs.tag }}" $files --draft --title "${{ needs.set-params.outputs.tag }}" --notes "Release ${{ needs.set-params.outputs.tag }}"
           fi
 
+  upload-sbom:
+    needs: [set-params, build-and-push, upload-artifacts]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Collect SBOMs
+        run: |
+          scripts/collect-sboms.sh "${{ needs.set-params.outputs.tag }}" \
+            "${{ needs.set-params.outputs.epp_name }}" \
+            "${{ needs.set-params.outputs.sidecar_name }}" \
+            "${{ needs.set-params.outputs.coordinator_name }}"
+
+      - name: Upload SBOMs to the release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ needs.set-params.outputs.tag }}" sbom/* --clobber
