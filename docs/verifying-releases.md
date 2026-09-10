@@ -24,7 +24,7 @@ an SBOM. The commands below report a missing attestation for them.
 
 Verification needs either [`gh`](https://cli.github.com) or
 [`cosign`](https://github.com/sigstore/cosign). Reading the SBOM needs
-`docker buildx`.
+`docker buildx` and `jq` for processing the output.
 
 `gh` must be 2.51.0 or later for `--signer-workflow` and 2.64.0 or later for
 `--bundle-from-oci`. It requires authentication (`gh auth login`) because it
