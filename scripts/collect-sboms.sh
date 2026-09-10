@@ -12,7 +12,6 @@ set -euo pipefail
 
 registry="${REGISTRY:-ghcr.io/llm-d}"
 outdir="${OUTDIR:-sbom}"
-platforms=(linux/amd64 linux/arm64)
 
 tag="${1:?tag required}"
 shift
@@ -22,18 +21,25 @@ mkdir -p "$outdir"
 
 for image in "$@"; do
   ref="$registry/$image:$tag"
+  # The index listing drives the loop so the platforms collected are the ones
+  # the image was built for.
   digests=$(docker buildx imagetools inspect "$ref" --format \
     '{{ range .Manifest.Manifests }}{{ if .Platform }}{{ .Platform.OS }}/{{ .Platform.Architecture }} {{ .Digest }}{{ println }}{{ end }}{{ end }}')
+  [ -n "$digests" ] || { echo "$ref has no platform manifests" >&2; exit 1; }
 
-  for platform in "${platforms[@]}"; do
+  while read -r platform digest; do
+    # buildx lists its attestation manifests as unknown/unknown.
+    if [ "$platform" = "unknown/unknown" ]; then
+      continue
+    fi
+
     file="$image-$tag-${platform//\//-}.spdx.json"
-    # Validate before moving into place so a failed run leaves no partial file.
+    # Validate before moving so a failed extraction never lands at the final path.
     docker buildx imagetools inspect "$ref" \
       --format "{{ json (index .SBOM \"$platform\").SPDX }}" > "$outdir/.$file"
     jq -e '.spdxVersion' "$outdir/.$file" > /dev/null
     mv "$outdir/.$file" "$outdir/$file"
 
-    digest=$(awk -v p="$platform" '$1 == p { print $2 }' <<< "$digests")
     printf '%s  %s@%s\n' "$file" "$ref" "$digest" >> "$outdir/sbom-digests.txt"
-  done
+  done <<< "$digests"
 done
