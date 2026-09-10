@@ -75,7 +75,7 @@ The following policy criteria will be enforced:
 - Subject Alternative Name must match regex: ^https://github.com/llm-d/llm-d-router/.github/workflows/ci-build-images.yaml
 - OIDC Issuer must match:................... https://token.actions.githubusercontent.com
 
-✓ Verification succeeded!
+Verification succeeded!
 ```
 
 The attestation bundle is stored both in the GitHub API and in the registry as
@@ -127,7 +127,7 @@ identity that should not match and check that it fails:
 $ gh attestation verify "oci://$IMAGE@$DIGEST" \
     --repo llm-d/llm-d-router \
     --signer-workflow llm-d/llm-d-router/.github/workflows/ci-release.yaml
-✗ Sigstore verification failed
+Sigstore verification failed
 
 Error: verifying with issuer "sigstore.dev"
 ```
