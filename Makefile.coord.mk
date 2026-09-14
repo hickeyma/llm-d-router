@@ -33,11 +33,11 @@ export COORDINATOR_IMAGE VLLM_IMAGE EPP_IMAGE VLLM_RENDER_IMAGE VLLM_RENDER_PORT
 # A locally edited Dockerfile.builder hashes to a tag that
 # was never published, so image-build-builder misses the pull and falls back
 # to a local build instead of running against a stale published image.
-BUILDER_TAG ?= $(shell git hash-object Dockerfile.builder)
+BUILDER_TAG ?= $(shell git hash-object Dockerfile.builder 2>/dev/null || echo dev)
 BUILDER_TAG_BASE ?= $(IMAGE_REGISTRY)/$(BUILDER_IMAGE_NAME)
 export BUILDER_IMAGE ?= $(BUILDER_TAG_BASE):$(BUILDER_TAG)
 # Escape hatch for testing local Dockerfile.builder changes without a matching
-# published tag:. Set BUILDER_PULL=false to force a local build.
+# published tag. Set BUILDER_PULL=false to force a local build.
 BUILDER_PULL ?= true
 
 CONTAINER_RUNTIME := $(shell { command -v docker >/dev/null 2>&1 && echo docker; } || { command -v podman >/dev/null 2>&1 && echo podman; } || echo "")
