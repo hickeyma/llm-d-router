@@ -36,8 +36,9 @@ export COORDINATOR_IMAGE VLLM_IMAGE EPP_IMAGE VLLM_RENDER_IMAGE VLLM_RENDER_PORT
 BUILDER_TAG ?= $(shell git hash-object Dockerfile.builder 2>/dev/null || echo dev)
 BUILDER_TAG_BASE ?= $(IMAGE_REGISTRY)/$(BUILDER_IMAGE_NAME)
 export BUILDER_IMAGE ?= $(BUILDER_TAG_BASE):$(BUILDER_TAG)
-# Escape hatch for testing local Dockerfile.builder changes without a matching
-# published tag. Set BUILDER_PULL=false to force a local build.
+# Set BUILDER_PULL=false to skip pulling the published tag, for testing
+# local Dockerfile.builder changes or working offline. A local image under
+# the current tag is still reused ahead of both the pull and a build.
 BUILDER_PULL ?= true
 
 CONTAINER_RUNTIME := $(shell { command -v docker >/dev/null 2>&1 && echo docker; } || { command -v podman >/dev/null 2>&1 && echo podman; } || echo "")
