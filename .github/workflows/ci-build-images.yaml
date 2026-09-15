@@ -223,6 +223,14 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # Dockerfile.builder executes RUN steps on the target platform, so the
+      # arm64 leg needs emulation. The service Dockerfiles cross-compile instead.
+      - name: Set up QEMU
+        if: steps.check.outputs.exists == 'false'
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+
       - name: Build builder AMD64 image (no push)
         if: steps.check.outputs.exists == 'false'
         uses: ./.github/actions/docker-build-and-push
