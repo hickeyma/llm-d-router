@@ -187,8 +187,9 @@ jobs:
           subject-digest: ${{ steps.push-coordinator.outputs.digest }}
           push-to-registry: true
 
-  # Gated on registry existence rather than a path filter, so a push that fails
-  # or is skipped is retried on the next call instead of never firing again.
+  # Gated on a published and attested image rather than a path filter, so a push
+  # or attestation that fails or is skipped is retried on the next call instead
+  # of never firing again.
   # Not needed for push-helm-charts because the builder is unrelated to chart publishing.
   build-builder:
     runs-on: ubuntu-latest
@@ -214,10 +215,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Check whether the builder image is already published
+      - name: Check whether the builder image is already published and attested
         id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if docker manifest inspect ghcr.io/llm-d/llm-d-builder:${{ steps.builder-tag.outputs.tag }} > /dev/null 2>&1; then
+          if gh attestation verify oci://ghcr.io/llm-d/llm-d-builder:${{ steps.builder-tag.outputs.tag }} \
+              --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
