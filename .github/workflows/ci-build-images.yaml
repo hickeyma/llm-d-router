@@ -259,7 +259,8 @@ jobs:
           exit-code: '0'
 
       # prerelease: 'true' suppresses the composite action's floating :latest
-      # tag. The builder is addressed only by its content hash tag.
+      # tag and commit-sha is unset to skip the per-commit tag. The builder is
+      # addressed only by its content hash tag.
       - name: Push builder image for both AMD64 and ARM64
         if: steps.check.outputs.exists == 'false'
         id: push-builder
