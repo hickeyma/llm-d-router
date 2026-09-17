@@ -24,9 +24,11 @@ for image in "$@"; do
   # The index digest is captured alongside the platform listing so the SBOM
   # lookups below can pin to it instead of the mutable tag. Otherwise a
   # second push to the same tag between the two inspections could pair one
-  # image's platform digest with another image's SBOM.
+  # image's platform digest with another image's SBOM. buildx lists its
+  # attestation manifests as unknown/unknown, so they are left out here and
+  # the check below also catches an index holding only attestations.
   listing=$(docker buildx imagetools inspect "$ref" --format \
-    '{{ .Manifest.Digest }}{{ println }}{{ range .Manifest.Manifests }}{{ if .Platform }}{{ .Platform.OS }}/{{ .Platform.Architecture }} {{ .Digest }}{{ println }}{{ end }}{{ end }}')
+    '{{ .Manifest.Digest }}{{ println }}{{ range .Manifest.Manifests }}{{ if .Platform }}{{ if ne .Platform.OS "unknown" }}{{ .Platform.OS }}/{{ .Platform.Architecture }} {{ .Digest }}{{ println }}{{ end }}{{ end }}{{ end }}')
   index_digest=$(head -n1 <<< "$listing")
   digests=$(tail -n +2 <<< "$listing")
   [ -n "$digests" ] || { echo "$ref has no platform manifests" >&2; exit 1; }
@@ -34,11 +36,6 @@ for image in "$@"; do
   pinned="$registry/$image@$index_digest"
 
   while read -r platform digest; do
-    # buildx lists its attestation manifests as unknown/unknown.
-    if [ "$platform" = "unknown/unknown" ]; then
-      continue
-    fi
-
     file="$image-$tag-${platform//\//-}.spdx.json"
     # Validate before moving so a failed extraction never lands at the final path.
     docker buildx imagetools inspect "$pinned" \
