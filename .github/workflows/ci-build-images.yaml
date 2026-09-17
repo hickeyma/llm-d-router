@@ -215,15 +215,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
+      # gh exits 1 for a missing tag, a missing attestation and an API error alike,
+      # so any failure rebuilds. The output stays in the log to show which one it was.
       - name: Check whether the builder image is already published and attested
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh attestation verify oci://ghcr.io/llm-d/llm-d-builder:${{ steps.builder-tag.outputs.tag }} \
-              --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+              --repo "$GITHUB_REPOSITORY"; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
+            echo "::notice::No verified attestation for the builder tag, rebuilding"
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
