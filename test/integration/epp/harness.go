@@ -1,5 +1,6 @@
 /*
 Copyright 2025 The Kubernetes Authors.
+Copyright 2026 The llm-d Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -49,10 +50,12 @@ import (
 
 	eppRunner "github.com/llm-d/llm-d-router/cmd/epp/runner"
 	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
+	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
 	"github.com/llm-d/llm-d-router/pkg/epp/datastore"
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	dlmocks "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/source/mocks"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/flowcontrol/saturationdetector/utilization"
 	"github.com/llm-d/llm-d-router/pkg/epp/metrics"
 	eppServer "github.com/llm-d/llm-d-router/pkg/epp/server"
 	testutil "github.com/llm-d/llm-d-router/pkg/epp/util/testing"
@@ -223,6 +226,7 @@ func NewTestHarness(ctx context.Context, t *testing.T, opts ...HarnessOption) *T
 			sdktrace.WithSyncer(exporter),
 		)
 		otel.SetTracerProvider(tp)
+		tracing.InitTextMapPropagator()
 	}
 
 	// Reserve the ext_proc port once, up front: the server serves on this listener, so
@@ -437,6 +441,30 @@ func (h *TestHarness) WaitForSync(expectedPods int, checkModelObjective string) 
 		lastPodsFound,
 		expectedPods,
 	)
+	return h
+}
+
+// WaitForMetricsDelivery blocks until every tracked endpoint has received a metrics update.
+// Endpoints start with a zero UpdateTime, which the default utilization-detector filter
+// drops as stale; tests asserting on the full candidate set need it.
+func (h *TestHarness) WaitForMetricsDelivery() *TestHarness {
+	h.t.Helper()
+
+	require.Eventually(h.t, func() bool {
+		pods := h.Datastore.PodList(datastore.AllPodsPredicate)
+		if len(pods) == 0 {
+			return false
+		}
+		for _, pod := range pods {
+			// Half the staleness threshold: fresh enough that the filter still accepts
+			// the endpoint once the wait returns, loose enough to tolerate a slow polling tick.
+			if m := pod.GetMetrics(); m == nil || time.Since(m.UpdateTime) > utilization.DefaultMetricsStalenessThreshold/2 {
+				return false
+			}
+		}
+		return true
+	}, 10*time.Second, 50*time.Millisecond,
+		"Timed out waiting for endpoint metrics delivery")
 	return h
 }
 

@@ -29,6 +29,7 @@ import (
 	. "github.com/onsi/ginkgo/v2" // nolint:revive
 	. "github.com/onsi/gomega"    // nolint:revive
 
+	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
 	"github.com/llm-d/llm-d-router/pkg/common/routing"
 )
 
@@ -45,7 +46,7 @@ var _ = Describe("Mooncake Connector", func() {
 		// start a mock bootstrap server that returns map
 		bootstrapServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(bootstrapResponse)) //nolint:all
+			_, _ = w.Write([]byte(bootstrapResponse))
 		}))
 		DeferCleanup(bootstrapServer.Close)
 
@@ -63,8 +64,8 @@ var _ = Describe("Mooncake Connector", func() {
 	It("should send concurrent requests with correct mooncake kv_transfer_params", func() {
 		proxyBaseAddr := testInfo.startProxy()
 
-		body := chatCompletionsRequestBodyWithMaxCompletionTokens
-		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath, bytes.NewReader([]byte(body)))
+		body := chatCompletionsRequestBodyWithMaxCompletionCap
+		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+reqcommon.PathChatCompletions, bytes.NewReader([]byte(body)))
 		Expect(err).ToNot(HaveOccurred())
 
 		// Use the bootstrap server's host as the prefill host so engine_id discovery works
@@ -134,11 +135,11 @@ var _ = Describe("Mooncake Connector", func() {
 		<-testInfo.stoppedCh
 	})
 
-	It("should strip min_tokens from the prefill leg and restore it in decode", func() {
+	It("should strip min_tokens from the prefill request and restore it in decode", func() {
 		proxyBaseAddr := testInfo.startProxy()
 
-		body := chatCompletionsRequestBodyWithMinTokens
-		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath, bytes.NewReader([]byte(body)))
+		body := chatCompletionsRequestBodyWithMinCap
+		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+reqcommon.PathChatCompletions, bytes.NewReader([]byte(body)))
 		Expect(err).ToNot(HaveOccurred())
 
 		prefillHostPort := testInfo.prefillBackend.URL[len("http://"):]
@@ -162,6 +163,13 @@ var _ = Describe("Mooncake Connector", func() {
 		Expect(testInfo.decodeHandler.RequestCount.Load()).To(BeNumerically("==", 1))
 		dreq := testInfo.decodeHandler.GetCompletionRequests()[0]
 		Expect(dreq).To(HaveKeyWithValue(requestFieldMinTokens, BeNumerically("==", 5)))
+
+		testInfo.cancelFn()
+		<-testInfo.stoppedCh
+	})
+
+	It("should cap sampling_params in the prefill request and restore originals in decode", func() {
+		expectGenerateRequestTokenLimits(testInfo)
 
 		testInfo.cancelFn()
 		<-testInfo.stoppedCh
@@ -202,7 +210,7 @@ var _ = Describe("Mooncake Connector", func() {
 
 		proxyBaseAddr := testInfo.startProxy()
 
-		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath, bytes.NewReader([]byte(chatCompletionsRequestBody)))
+		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+reqcommon.PathChatCompletions, bytes.NewReader([]byte(chatCompletionsRequestBody)))
 		Expect(err).ToNot(HaveOccurred())
 
 		prefillHostPort := testInfo.prefillBackend.URL[len("http://"):]
@@ -232,7 +240,7 @@ var _ = Describe("Mooncake Connector", func() {
 
 		proxyBaseAddr := testInfo.startProxy()
 
-		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+ChatCompletionsPath, bytes.NewReader([]byte(chatCompletionsRequestBody)))
+		req, err := http.NewRequest(http.MethodPost, proxyBaseAddr+reqcommon.PathChatCompletions, bytes.NewReader([]byte(chatCompletionsRequestBody)))
 		Expect(err).ToNot(HaveOccurred())
 
 		prefillHostPort := testInfo.prefillBackend.URL[len("http://"):]

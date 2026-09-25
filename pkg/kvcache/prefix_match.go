@@ -21,11 +21,11 @@ import (
 	"math"
 	"sync"
 
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"k8s.io/apimachinery/pkg/util/sets"
 
+	"github.com/llm-d/llm-d-router/pkg/common/observability/semconv"
 	"github.com/llm-d/llm-d-router/pkg/common/observability/tracing"
 	"github.com/llm-d/llm-d-router/pkg/kvcache/kvblock"
 	"github.com/llm-d/llm-d-router/pkg/kvcache/metrics"
@@ -37,8 +37,12 @@ import (
 // same chain.
 const SpeculativeTier = "speculative"
 
-// defaultTierWeight scores blocks held in a tier without a configured weight.
-const defaultTierWeight = 1.0
+// speculativeTierWeight scores speculative entries when the speculative tier
+// has no configured weight.
+const speculativeTierWeight = 1.0
+
+// unknownTierWeight scores blocks held in a tier without a configured weight.
+const unknownTierWeight = 0.0
 
 // matchCancellationMask paces context-cancellation checks over key
 // positions: positions where pos&mask == 0 poll ctx.Err().
@@ -48,11 +52,16 @@ const matchCancellationMask = 255
 // the contiguous chain of keys the pod holds, counted from the first key.
 type PodMatch struct {
 	// WeightedScore sums, per block of the chain, the highest device-tier
-	// weight among the pod's entries for that block; tiers without a
-	// configured weight count defaultTierWeight.
+	// weight among the pod's entries for that block. Tiers without a
+	// configured weight count unknownTierWeight; speculative entries count
+	// speculativeTierWeight unless the speculative tier is configured.
 	WeightedScore float64
 	// MatchedBlocks is the chain length in blocks, regardless of tier.
 	MatchedBlocks int
+	// ConfirmedBlocks is the chain length in blocks counting only keys the
+	// pod holds in an engine-reported device tier; the tier may change from
+	// block to block. Speculative entries end the chain.
+	ConfirmedBlocks int
 	// BlocksByTier is the per-tier chain length: a tier counts a block only
 	// while the pod holds every previous block in that same tier.
 	// Speculative entries count under SpeculativeTier. Never nil.
@@ -77,9 +86,9 @@ func (k *Indexer) MatchBlockKeys(ctx context.Context, keys []kvblock.BlockHash,
 	)
 	defer span.End()
 	span.SetAttributes(
-		attribute.Int("llm_d.kv_cache.prefix_match.key_count", len(keys)),
-		attribute.Int("llm_d.kv_cache.prefix_match.pod_filter_count", podFilter.Len()),
-		attribute.Bool("llm_d.kv_cache.prefix_match.walked", k.keyWalker != nil),
+		semconv.LLMDKVCachePrefixMatchKeyCount(len(keys)),
+		semconv.LLMDKVCachePrefixMatchPodFilterCount(podFilter.Len()),
+		semconv.LLMDKVCachePrefixMatchWalked(k.keyWalker != nil),
 	)
 
 	var matches map[string]PodMatch
@@ -100,8 +109,8 @@ func (k *Indexer) MatchBlockKeys(ctx context.Context, keys []kvblock.BlockHash,
 		metrics.LookupHits.Add(float64(blocksFound))
 	}
 	span.SetAttributes(
-		attribute.Int("llm_d.kv_cache.prefix_match.pods_matched", len(matches)),
-		attribute.Int("llm_d.kv_cache.prefix_match.longest_chain", blocksFound),
+		semconv.LLMDKVCachePrefixMatchPodsMatched(len(matches)),
+		semconv.LLMDKVCachePrefixMatchLongestChain(blocksFound),
 	)
 	return matches, nil
 }
@@ -193,9 +202,19 @@ func (t ordinalTable) of(name string) uint32 {
 	if id, ok := t[name]; ok {
 		return id
 	}
-	id := uint32(len(t))
+	id := clampOrdinal(len(t))
 	t[name] = id
 	return id
+}
+
+// clampOrdinal bounds a table size below the math.MaxUint32 sentinel that
+// speculativeTierOrdinal reserves, so a table that somehow grew that large
+// cannot collide with it.
+func clampOrdinal(n int) uint32 {
+	if n > math.MaxUint32-1 {
+		n = math.MaxUint32 - 1
+	}
+	return uint32(n)
 }
 
 // speculativeTierOrdinal keys the speculative per-tier chain. Feeders assign
@@ -205,7 +224,7 @@ const speculativeTierOrdinal = math.MaxUint32
 // slotRef maps one pod ordinal to a request-local slot.
 type slotRef struct {
 	ordinal uint32
-	slot    uint32 // slot index plus one; zero marks an empty bucket
+	slot    int32 // slot index plus one; zero marks an empty bucket
 }
 
 // slotTable is an open-addressed map from pod ordinal to request-local slot.
@@ -213,43 +232,48 @@ type slotRef struct {
 // the live candidates rather than with every ordinal an index ever assigned.
 type slotTable struct {
 	buckets []slotRef
+	mask    uint32
 }
 
 func (t *slotTable) reset(numEntries int) {
+	// Capping growth at 1<<31 keeps size-1 well within uint32 range, so the
+	// mask conversion below never truncates.
 	size := 2
-	for size < numEntries*2 {
+	for size < numEntries*2 && size < 1<<31 {
 		size <<= 1
 	}
 	if cap(t.buckets) < size {
 		t.buckets = make([]slotRef, size)
-		return
+	} else {
+		t.buckets = t.buckets[:size]
+		clear(t.buckets)
 	}
-	t.buckets = t.buckets[:size]
-	clear(t.buckets)
+	if size-1 > math.MaxUint32 {
+		size = math.MaxUint32 + 1
+	}
+	t.mask = uint32(size - 1)
 }
 
 func (t *slotTable) lookup(ordinal uint32) (int32, bool) {
-	mask := uint32(len(t.buckets) - 1)
-	i := ordinal * 2654435761 & mask
+	i := ordinal * 2654435761 & t.mask
 	for {
 		b := t.buckets[i]
 		if b.slot == 0 {
 			return 0, false
 		}
 		if b.ordinal == ordinal {
-			return int32(b.slot - 1), true
+			return b.slot - 1, true
 		}
-		i = (i + 1) & mask
+		i = (i + 1) & t.mask
 	}
 }
 
 func (t *slotTable) insert(ordinal uint32, slot int32) {
-	mask := uint32(len(t.buckets) - 1)
-	i := ordinal * 2654435761 & mask
+	i := ordinal * 2654435761 & t.mask
 	for t.buckets[i].slot != 0 {
-		i = (i + 1) & mask
+		i = (i + 1) & t.mask
 	}
-	t.buckets[i] = slotRef{ordinal: ordinal, slot: uint32(slot) + 1}
+	t.buckets[i] = slotRef{ordinal: ordinal, slot: slot + 1}
 }
 
 // tierChain tracks one tier's contiguous prefix for a candidate pod.
@@ -278,6 +302,11 @@ type matchSlot struct {
 	seen   uint32
 	weight float64
 	tiers  []tierChain
+	// confirmed tracks the chain of keys held in a non-speculative tier;
+	// confirmedSeen is the key stamp of the last key holding one.
+	confirmed      int
+	confirmedSeen  uint32
+	confirmedAlive bool
 }
 
 // prefixAccumulator folds an ordered walk over request keys into per-pod
@@ -352,7 +381,14 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 		}
 		slot := &a.slots[s]
 
-		w := a.weightOf(ref.DeviceTier, ref.TierOrdinal)
+		tier, tierOrdinal := ref.DeviceTier, ref.TierOrdinal
+		if ref.Speculative || ref.DeviceTier == SpeculativeTier {
+			tier, tierOrdinal = SpeculativeTier, speculativeTierOrdinal
+		} else {
+			slot.confirmedSeen = a.keyStamp
+		}
+
+		w := a.weightOf(tier, tierOrdinal)
 		switch {
 		case slot.seen != a.keyStamp:
 			slot.seen = a.keyStamp
@@ -361,10 +397,6 @@ func (a *prefixAccumulator) key(entries []kvblock.EntryRef) bool {
 			slot.weight = w
 		}
 
-		tier, tierOrdinal := ref.DeviceTier, ref.TierOrdinal
-		if ref.Speculative || ref.DeviceTier == SpeculativeTier {
-			tier, tierOrdinal = SpeculativeTier, speculativeTierOrdinal
-		}
 		if !a.stampTier(slot, tierOrdinal) && a.first {
 			slot.tiers = append(slot.tiers, tierChain{ordinal: tierOrdinal, name: tier, seen: a.keyStamp, alive: true})
 		}
@@ -392,6 +424,9 @@ func (a *prefixAccumulator) endKey() bool {
 		for i := range a.slots {
 			s := &a.slots[i]
 			s.matched, s.score = 1, s.weight
+			if s.confirmedSeen == a.keyStamp {
+				s.confirmed, s.confirmedAlive = 1, true
+			}
 			for t := range s.tiers {
 				s.tiers[t].count = 1
 			}
@@ -408,6 +443,13 @@ func (a *prefixAccumulator) endKey() bool {
 		}
 		s.matched++
 		s.score += s.weight
+		switch {
+		case !s.confirmedAlive:
+		case s.confirmedSeen == a.keyStamp:
+			s.confirmed++
+		default:
+			s.confirmedAlive = false
+		}
 		for t := range s.tiers {
 			tc := &s.tiers[t]
 			switch {
@@ -433,7 +475,7 @@ func (a *prefixAccumulator) result() map[string]PodMatch {
 		for _, tc := range s.tiers {
 			byTier[tc.name] = tc.count
 		}
-		out[s.pod] = PodMatch{WeightedScore: s.score, MatchedBlocks: s.matched, BlocksByTier: byTier}
+		out[s.pod] = PodMatch{WeightedScore: s.score, MatchedBlocks: s.matched, ConfirmedBlocks: s.confirmed, BlocksByTier: byTier}
 	}
 	return out
 }
@@ -449,7 +491,13 @@ func (a *prefixAccumulator) newSlot(pod string) int32 {
 	} else {
 		a.slots = append(a.slots, matchSlot{pod: pod})
 	}
-	return int32(n)
+	// Candidate pods per request stay far below the int32 range; clamp
+	// defensively so a pathological request cannot wrap the index negative.
+	slot := n
+	if slot > math.MaxInt32 {
+		slot = math.MaxInt32
+	}
+	return int32(slot)
 }
 
 // weightOf resolves a tier's weight, caching by ordinal so the configured
@@ -460,7 +508,10 @@ func (a *prefixAccumulator) weightOf(tier string, ordinal uint32) float64 {
 			return a.weightCache[i].weight
 		}
 	}
-	w := defaultTierWeight
+	w := unknownTierWeight
+	if tier == SpeculativeTier {
+		w = speculativeTierWeight
+	}
 	if configured, ok := a.weights[tier]; ok {
 		w = configured
 	}

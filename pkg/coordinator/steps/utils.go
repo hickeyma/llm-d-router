@@ -27,7 +27,6 @@ import (
 	logutil "github.com/llm-d/llm-d-router/pkg/common/observability/logging"
 	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
 
-	"github.com/llm-d/llm-d-router/pkg/coordinator/gateway"
 	"github.com/llm-d/llm-d-router/pkg/coordinator/pipeline"
 )
 
@@ -60,49 +59,39 @@ func parseUseOpenAIFormat(params map[string]any) (bool, error) {
 	return v, nil
 }
 
-// resolveFormat maps a request path to the wire format a step emits. Completions
-// is always honored; otherwise OpenAI formats collapse to FormatGenerate unless
-// useOpenAIFormat is set.
-func resolveFormat(useOpenAIFormat bool, path string) gateway.RequestFormat {
-	detected := gateway.DetectFormat(path)
-	if detected == gateway.FormatCompletions {
-		return gateway.FormatCompletions
+// rejectUseOpenAIFormatOverride returns an error if params sets use_openai_format.
+// decode and conditional-decode derive their body format directly from the
+// request's original path, so a step-level override has no effect; rejecting
+// the key surfaces stale config instead of silently ignoring it.
+func rejectUseOpenAIFormatOverride(step string, params map[string]any) error {
+	if _, ok := params["use_openai_format"]; ok {
+		return fmt.Errorf("%s: use_openai_format is not a valid parameter for this step", step)
 	}
-	if !useOpenAIFormat {
-		return gateway.FormatGenerate
-	}
-	return detected
+	return nil
 }
 
-// capSingleTokenOutput rewrites body into a single-output-token, non-streaming
-// request for the synthetic prefill and encode legs.
-//
-// Chat-completions and completions bodies carry max_tokens/max_completion_tokens/
-// stream/stream_options at the top level, same as the sidecar's synthetic
-// requests, so they share reqcommon.PrimeSingleTokenRequest verbatim. The
-// generate format's token-limit fields live under sampling_params instead
-// (vLLM's GenerateRequest schema); stream/stream_options stay top-level there
-// too, and generate has no max_completion_tokens-equivalent field, so only the
-// max_tokens/min_tokens capping (reqcommon.CapMaxTokensField) is reusable for it.
-//
-// TODO: max_output_tokens is another client-supplied output cap (Responses
-// API) that a client can send instead of max_tokens/max_completion_tokens; it
-// should be capped to 1 here as well so the synthetic legs stay single-token.
-func capSingleTokenOutput(body map[string]any, format gateway.RequestFormat) {
-	if format != gateway.FormatGenerate {
-		reqcommon.PrimeSingleTokenRequest(body)
-		return
-	}
+// unreachableFormatError builds an error for a request format with no
+// registered coordinator route (see server.go), signaling a routing bug
+// rather than a client error.
+func unreachableFormatError(format reqcommon.APIType) error {
+	return fmt.Errorf("unsupported request format %v: no coordinator route serves it", format)
+}
 
-	sp, ok := body[reqcommon.FieldSamplingParams].(map[string]any)
-	if !ok {
-		sp = map[string]any{}
-		body[reqcommon.FieldSamplingParams] = sp
+// resolveFormat maps a request path to the wire format a step emits. The steps
+// build only Completions, Chat Completions, and generate bodies, so any other
+// API collapses to APITypeVLLMGenerate; Chat Completions additionally requires
+// useOpenAIFormat. Generate is the fallback because its body carries the prompt
+// as reqCtx.TokenIDs and does not depend on the client's request shape.
+func resolveFormat(useOpenAIFormat bool, path string) reqcommon.APIType {
+	switch detected := reqcommon.DetectAPIType(path); detected {
+	case reqcommon.APITypeCompletions:
+		return detected
+	case reqcommon.APITypeChatCompletions:
+		if useOpenAIFormat {
+			return detected
+		}
 	}
-	reqcommon.CapMaxTokensField(sp)
-
-	body[reqcommon.FieldStream] = false
-	delete(body, reqcommon.FieldStreamOptions)
+	return reqcommon.APITypeVLLMGenerate
 }
 
 // buildMMFeatures builds the multimodal features map (mm_hashes, mm_placeholders,
@@ -147,24 +136,6 @@ func mmKwargsField(kwargs []string) map[string][]any {
 		}
 	}
 	return map[string][]any{ModalityImage: items}
-}
-
-// setGenerateTransferParams nests the kv/ec transfer params under
-// sampling_params.extra_args, the only place the /inference/v1/generate engine
-// reads them (top-level kv_transfer_params/ec_transfer_params are ignored on
-// input). It get-or-creates extra_args on the given sampling map so a client's
-// existing generation fields survive. ecParams may be empty, in which case
-// ec_transfer_params is left unset.
-func setGenerateTransferParams(sampling map[string]any, kvParams any, ecParams map[string]any) {
-	extraArgs, ok := sampling[reqcommon.FieldExtraArgs].(map[string]any)
-	if !ok {
-		extraArgs = map[string]any{}
-		sampling[reqcommon.FieldExtraArgs] = extraArgs
-	}
-	extraArgs[reqcommon.FieldKVTransferParams] = kvParams
-	if len(ecParams) > 0 {
-		extraArgs[reqcommon.FieldECTransferParams] = ecParams
-	}
 }
 
 // coerceParamsMap coerces a transfer-params value from an upstream response to a
@@ -375,34 +346,6 @@ func extractMultimodalEntries(features map[string]any) ([]pipeline.MultimodalEnt
 		}
 	}
 	return entries, nil
-}
-
-// validateSamplingParams checks that sampling_params and its nested extra_args,
-// when present, are JSON objects. Both are optional. The decode step merges
-// kv_transfer_params into sampling_params.extra_args; a non-object at either
-// level would fall into its fallback branch and be silently replaced with an
-// empty map, discarding client-requested generation parameters with no error.
-// Validating once at ingestion keeps that path fail-loud, consistent with
-// token_ids and features.
-func validateSamplingParams(body map[string]any) error {
-	raw, ok := body[reqcommon.FieldSamplingParams]
-	if !ok || raw == nil {
-		return nil
-	}
-	sampling, ok := raw.(map[string]any)
-	if !ok {
-		return fmt.Errorf("%s must be an object, got %T: %w",
-			reqcommon.FieldSamplingParams, raw, pipeline.ErrBadRequest)
-	}
-	ea, ok := sampling[reqcommon.FieldExtraArgs]
-	if !ok || ea == nil {
-		return nil
-	}
-	if _, ok := ea.(map[string]any); !ok {
-		return fmt.Errorf("%s.%s must be an object, got %T: %w",
-			reqcommon.FieldSamplingParams, reqcommon.FieldExtraArgs, ea, pipeline.ErrBadRequest)
-	}
-	return nil
 }
 
 // validatePlaceholderBounds checks that every placeholder span [offset,

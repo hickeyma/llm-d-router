@@ -28,7 +28,7 @@ import (
 	reqcommon "github.com/llm-d/llm-d-router/pkg/common/request"
 )
 
-func (s *Server) handleSharedStorage(w http.ResponseWriter, r *http.Request, prefillPodHostPort string) {
+func (s *Server) handleSharedStorage(w http.ResponseWriter, r *http.Request, prefillPodHostPort string, apiType reqcommon.APIType) {
 	s.logger.V(logging.DEBUG).Info("running Shared Storage protocol", "url", prefillPodHostPort)
 
 	original, body, ok := s.readJSONBody(r, w)
@@ -56,7 +56,7 @@ func (s *Server) handleSharedStorage(w http.ResponseWriter, r *http.Request, pre
 
 	// we clone the completion request to avoid modifying the original request
 	prefillRequest := maps.Clone(body)
-	if err := s.prefill(w, r, prefillPodHostPort, prefillRequest); err != nil {
+	if err := s.prefill(w, r, prefillPodHostPort, prefillRequest, apiType); err != nil {
 		s.logger.Error(err, "prefill failed")
 		return
 	}
@@ -96,7 +96,7 @@ func (s *Server) tryDecodeBuffered(w http.ResponseWriter, r *http.Request) (bool
 
 		w.WriteHeader(dw.statusCode)
 		if dw.buffer.Len() > 0 {
-			w.Write(dw.buffer.Bytes()) //nolint:errcheck
+			WriteAll(w, dw.buffer.Bytes())
 		}
 
 		err := errors.New("decode request failed")
@@ -123,7 +123,7 @@ func (s *Server) tryDecodeBuffered(w http.ResponseWriter, r *http.Request) (bool
 
 	// Decode succeeded, write response to client
 	maps.Copy(w.Header(), dw.headers)
-	w.Write(dw.buffer.Bytes()) //nolint:errcheck
+	WriteAll(w, dw.buffer.Bytes())
 
 	return false, nil
 }
@@ -215,9 +215,9 @@ func (s *Server) checkBufferedResponseForCacheThreshold(data string) bool {
 }
 
 // prefill routes a request to a prefill node
-func (s *Server) prefill(w http.ResponseWriter, r *http.Request, prefillPodHostPort string, body map[string]any) error {
+func (s *Server) prefill(w http.ResponseWriter, r *http.Request, prefillPodHostPort string, body map[string]any, apiType reqcommon.APIType) error {
 	// Prepare prefill request
-	reqcommon.PrimeSingleTokenRequest(body)
+	reqcommon.CapSingleToken(body, apiType)
 	body[requestFieldCacheHitThreshold] = 0
 
 	pbody, err := json.Marshal(body)
@@ -246,7 +246,7 @@ func (s *Server) prefill(w http.ResponseWriter, r *http.Request, prefillPodHostP
 		s.logger.Error(nil, "prefill request failed", "code", pw.statusCode)
 		w.WriteHeader(pw.statusCode)
 		if pw.buffer.Len() > 0 {
-			w.Write(pw.buffer.Bytes()) //nolint:errcheck
+			WriteAll(w, pw.buffer.Bytes())
 		}
 		return fmt.Errorf("prefill request failed with status code: %d", pw.statusCode)
 	}
